@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>五子棋 · 联机对战</title>
+<style>/* 同原版样式，略 */</style>
+</head>
+<body>
+<div class="container" id="app"></div>
+<script>
+// ============================================================
+//  五子棋 · 联机对战  (Firebase REST API, 纯 fetch 无 SDK)
+// ============================================================
+const FB = 'https://wuziqi-ff6c3-default-rtdb.firebaseio.com';
+const BOARD_SIZE = 15, CELL = 36, PADDING = 22, STONE_R = 15;
+const CANVAS_SIZE = PADDING * 2 + CELL * (BOARD_SIZE - 1);
+const BLACK = 1, WHITE = 2;
+const DIRS = [[0,1],[1,0],[1,1],[1,-1]];
+
+// localStorage 存玩家 ID
+let PID = localStorage.getItem('gomoku_pid');
+if (!PID) { PID = 'p' + Math.random().toString(36).slice(2, 10); localStorage.setItem('gomoku_pid', PID); }
+
+// ─── 全局状态 ──────────────────
+let mode = 'lobby';       // lobby | game
+let myRole = '';          // 'black' | 'white'
+let myPlayer = 0;         // 1 或 2
+let roomId = '';
+let grid, currentPlayer, lastMove, moveCount, gameOver, winner, winCells;
+let hoverPos = null, watchTimer = null, lastUpdateTime = 0;
+
+// ─── 渲染 UI ──────────────────
+function render() {
+  const app = document.getElementById('app');
+  if (mode === 'lobby') {
+    app.innerHTML = lobbyHTML();
+    bindLobby();
+  } else {
+    app.innerHTML = gameHTML();
+    setupCanvas();
+    buildLabels();
+    drawBoard();
+    updateStatusBar();
+    bindGame();
+  }
+}
+
+// ==================== LOBBY ====================
+function lobbyHTML() { return /*html*/`
+  <div class="header"><h1>五子棋</h1><p class="subtitle">联机对战</p></div>
+  <div class="deco"><div class="deco-stone black"></div><div class="deco-stone white"></div></div>
+  <div class="lobby-card" id="createCard">
+    <div class="card-title">创建房间</div>
+    <div class="card-desc">创建一个新房间，分享房间号给好友</div>
+    <button class="btn btn-primary" id="btnCreate">🎯 创建房间</button>
+    <div class="room-result" id="createResult" style="display:none"></div>
+  </div>
+  <div class="lobby-card">
+    <div class="card-title">加入房间</div>
+    <div class="card-desc">输入好友分享的 6 位房间号</div>
+    <input class="room-input" id="roomInput" type="number" placeholder="输入房间号" maxlength="6">
+    <button class="btn btn-outline" id="btnJoin">🚪 加入房间</button>
+    <div class="room-result" id="joinError" style="color:#d03020;display:none"></div>
+  </div>
+  <p class="tip">💡 创建房间 = 黑棋先手 · 加入房间 = 白棋后手</p>
+`;}
+
+function bindLobby() {
+  document.getElementById('btnCreate').onclick = createRoom;
+  document.getElementById('btnJoin').onclick = joinRoom;
+  document.getElementById('roomInput').onkeydown = e => { if (e.key==='Enter') joinRoom(); };
+}
+
+function genRoomId() { return String(Math.floor(100000 + Math.random() * 900000)); }
+
+async function createRoom() {
+  const btn = document.getElementById('btnCreate');
+  btn.disabled = true; btn.textContent = '创建中...';
+  roomId = genRoomId();
+  const init = { roomId, blackId: PID, whiteId: '', grid: emptyGrid(), currentPlayer: BLACK,
+    lastMove: null, moveCount: 0, gameOver: false, winner: 0, winCells: [], status: 'waiting', updateTime: Date.now() };
+  try {
+    const r = await fetch(`${FB}/games/${roomId}.json`, { method: 'PUT', body: JSON.stringify(init) });
+    if (!r.ok) throw new Error('network');
+    myRole = 'black'; myPlayer = BLACK;
+    enterGame();
+  } catch(e) {
+    btn.disabled = false; btn.textContent = '🎯 创建房间';
+    document.getElementById('createResult').style.display = 'block';
+    document.getElementById('createResult').textContent = '创建失败，请检查网络后重试';
+  }
+}
+
+async function joinRoom() {
+  const inp = document.getElementById('roomInput');
+  roomId = inp.value.trim();
+  if (roomId.length !== 6) { showJoinError('请输入 6 位房间号'); return; }
+  const btn = document.getElementById('btnJoin');
+  btn.disabled = true; btn.textContent = '加入中...';
+  try {
+    const r = await fetch(`${FB}/games/${roomId}.json`);
+    const g = await r.json();
+    if (!g) { showJoinError('房间不存在'); btn.disabled = false; btn.textContent = '🚪 加入房间'; return; }
+    if (g.status === 'finished') { showJoinError('该房间已结束'); btn.disabled = false; btn.textContent = '🚪 加入房间'; return; }
+    if (g.whiteId && g.whiteId !== PID) { showJoinError('房间已满'); btn.disabled = false; btn.textContent = '🚪 加入房间'; return; }
+    if (g.blackId === PID) {
+      // 重连——自己是黑棋
+    } else if (!g.whiteId) {
+      await fetch(`${FB}/games/${roomId}.json`, { method: 'PATCH', body: JSON.stringify({ whiteId: PID, status: 'playing', updateTime: Date.now() }) });
+    }
+    myRole = (g.blackId === PID) ? 'black' : 'white';
+    myPlayer = myRole === 'black' ? BLACK : WHITE;
+    enterGame();
+  } catch(e) { showJoinError('网络错误，请重试'); btn.disabled = false; btn.textContent = '🚪 加入房间'; }
+}
+
+function showJoinError(msg) {
+  const el = document.getElementById('joinError');
+  el.textContent = msg; el.style.display = 'block';
+  setTimeout(() => el.style.display = 'none', 3000);
+}
+
+// ==================== GAME ====================
+function enterGame() {
+  mode = 'game';
+  applyState(emptyGrid(), BLACK, null, 0, false, 0, [], 'waiting');
+  render();
+  startWatch();
+}
+
+// States
+function emptyGrid() { return Array.from({length:BOARD_SIZE}, ()=>Array(BOARD_SIZE).fill(0)); }
+function applyState(g, cp, lm, mc, go, w, wc, st) {
+  grid = g; currentPlayer = cp; lastMove = lm; moveCount = mc; gameOver = go; winner = w; winCells = wc || [];
+  if (st) window._status = st;
+}
+
+function gameHTML() { const st = window._status || 'waiting'; return /*html*/`
+  <div class="header"><h1>五子棋</h1><p class="subtitle">联机对战 · 房间 ${roomId}</p></div>
+  <div class="status-bar" id="statusBar">
+    <span class="stone-icon ${myRole==='black'?'black':'white'}" id="statusIcon"></span>
+    <span class="turn-text" id="turnText">${st==='waiting'?'等待对手加入...':statusLabel()}</span>
+    <span class="stone-icon ${myRole==='black'?'white':'black'}"></span>
+    <span class="captures" id="moveCount">第 ${moveCount} 手</span>
+  </div>
+  <div class="board-wrapper" id="boardWrapper">
+    <div class="col-labels" id="colLabels"></div>
+    <div class="board-area"><div class="row-labels" id="rowLabels"></div><canvas id="board"></canvas></div>
+  </div>
+  <div class="actions">
+    <button class="btn btn-ghost" id="btnLeave">🚪 离开</button>
+    <button class="btn btn-primary" id="btnRestart" ${gameOver?'':'disabled'}>🔄 再来一局</button>
+  </div>
+`;}
+
+function statusLabel() {
+  if (gameOver) return winner===BLACK?'黑棋获胜！':(winner===WHITE?'白棋获胜！':'平局');
+  return currentPlayer===myPlayer?'轮到你落子':'对手思考中...';
+}
+function updateStatusBar() {
+  const tt = document.getElementById('turnText'); if (!tt) return;
+  tt.textContent = statusLabel();
+  document.getElementById('moveCount').textContent = `第 ${moveCount} 手`;
+}
+
+// ─── Canvas ──────────────────
+function setupCanvas() {
+  const c = document.getElementById('board'); if (!c) return;
+  const ctx = c.getContext('2d');
+  const dpr = devicePixelRatio||1; c.width = CANVAS_SIZE*dpr; c.height = CANVAS_SIZE*dpr;
+  c.style.width = CANVAS_SIZE+'px'; c.style.height = CANVAS_SIZE+'px';
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  c._ctx = ctx;
+}
+function buildLabels() {
+  const colL = document.getElementById('colLabels'), rowL = document.getElementById('rowLabels');
+  if (!colL||!rowL) return;
+  colL.innerHTML = ''; rowL.innerHTML = '';
+  for (let i=0;i<BOARD_SIZE;i++) { const s=document.createElement('span');s.textContent=String.fromCharCode(65+i);colL.appendChild(s); }
+  for (let i=0;i<BOARD_SIZE;i++) { const s=document.createElement('span');s.textContent=BOARD_SIZE-i;rowL.appendChild(s); }
+}
+function drawBoard() {
+  const c = document.getElementById('board'); if (!c||!c._ctx) return;
+  const ctx = c._ctx; ctx.clearRect(0,0,CANVAS_SIZE,CANVAS_SIZE);
+  ctx.fillStyle='#dcb35c'; ctx.beginPath(); ctx.roundRect(0,0,CANVAS_SIZE,CANVAS_SIZE,6); ctx.fill();
+  ctx.strokeStyle='#5a3e1b'; ctx.lineWidth=0.8;
+  for (let i=0;i<BOARD_SIZE;i++) { const p=PADDING+i*CELL; ctx.beginPath(); ctx.moveTo(PADDING,p); ctx.lineTo(PADDING+CELL*(BOARD_SIZE-1),p); ctx.stroke(); ctx.beginPath(); ctx.moveTo(p,PADDING); ctx.lineTo(p,PADDING+CELL*(BOARD_SIZE-1)); ctx.stroke(); }
+  ctx.fillStyle='#3a2010';
+  [[3,3],[3,7],[3,11],[7,3],[7,7],[7,11],[11,3],[11,7],[11,11]].forEach(([r,c])=>{ctx.beginPath();ctx.arc(PADDING+c*CELL,PADDING+r*CELL,3,0,Math.PI*2);ctx.fill();});
+  if (winCells.length) { for (const {row,col} of winCells) { const x=PADDING+col*CELL,y=PADDING+row*CELL; ctx.fillStyle='rgba(255,80,60,.35)';ctx.beginPath();ctx.arc(x,y,STONE_R+4,0,Math.PI*2);ctx.fill();ctx.strokeStyle='#e04030';ctx.lineWidth=2.5;ctx.stroke();ctx.lineWidth=.8; } }
+  for (let r=0;r<BOARD_SIZE;r++) for (let c=0;c<BOARD_SIZE;c++) if (grid[r][c]) drawStone(ctx, PADDING+c*CELL, PADDING+r*CELL, grid[r][c]===BLACK?'black':'white', false);
+  if (lastMove&&!gameOver) { const {row,col}=lastMove,x=PADDING+col*CELL,y=PADDING+row*CELL; ctx.globalAlpha=.6+.4*Math.sin(Date.now()/400); ctx.fillStyle=currentPlayer===BLACK?'#fff':'#000'; ctx.beginPath();ctx.arc(x,y,5,0,Math.PI*2);ctx.fill();ctx.globalAlpha=1; }
+  if (hoverPos&&!gameOver&&grid[hoverPos.row][hoverPos.col]===0) drawStone(ctx, PADDING+hoverPos.col*CELL, PADDING+hoverPos.row*CELL, currentPlayer===BLACK?'black':'white', true);
+}
+function drawStone(ctx, x, y, color, ghost) { ctx.save();ctx.globalAlpha=ghost?.38:1; const grad=ctx.createRadialGradient(x-STONE_R*.3,y-STONE_R*.35,STONE_R*.1,x,y,STONE_R); if (color==='black') {grad.addColorStop(0,'#606060');grad.addColorStop(.45,'#2a2a2a');grad.addColorStop(.85,'#0a0a0a');grad.addColorStop(1,'#000');} else {grad.addColorStop(0,'#fff');grad.addColorStop(.4,'#f5f3ef');grad.addColorStop(.8,'#d4cfc8');grad.addColorStop(1,'#b8b2a8');} ctx.fillStyle=grad;ctx.beginPath();ctx.arc(x,y,STONE_R,0,Math.PI*2);ctx.fill(); if(!ghost){ctx.shadowColor=color==='black'?'rgba(0,0,0,.4)':'rgba(0,0,0,.15)';ctx.shadowBlur=4;ctx.shadowOffsetX=1;ctx.shadowOffsetY=1;ctx.fill();ctx.shadowColor='transparent';ctx.shadowBlur=0;ctx.shadowOffsetX=0;ctx.shadowOffsetY=0;} ctx.restore(); }
+
+// ─── Win check ──────────────
+function checkWin(g, row, col) { const p=g[row][col]; if (!p) return null; for (const [dr,dc] of DIRS) { const cells=[{row,col}]; for (let i=1;i<5;i++){const r=row+dr*i,c=col+dc*i;if(r<0||r>=BOARD_SIZE||c<0||c>=BOARD_SIZE)break;if(g[r][c]!==p)break;cells.push({row:r,col:c});} for (let i=1;i<5;i++){const r=row-dr*i,c=col-dc*i;if(r<0||r>=BOARD_SIZE||c<0||c>=BOARD_SIZE)break;if(g[r][c]!==p)break;cells.unshift({row:r,col:c});} if (cells.length>=5) return cells; } return null; }
+function isBoardFull(g) { for (let r=0;r<BOARD_SIZE;r++) for (let c=0;c<BOARD_SIZE;c++) if (!g[r][c]) return false; return true; }
+
+// ─── Touch handler ───────────
+function getClickPos(e) {
+  const c = document.getElementById('board'); if (!c) return null;
+  const rect=c.getBoundingClientRect(), mx=(e.clientX-rect.left)*(CANVAS_SIZE/rect.width), my=(e.clientY-rect.top)*(CANVAS_SIZE/rect.height);
+  const col=Math.round((mx-PADDING)/CELL), row=Math.round((my-PADDING)/CELL);
+  if (col<0||col>=BOARD_SIZE||row<0||row>=BOARD_SIZE) return null;
+  if (Math.hypot(mx-(PADDING+col*CELL), my-(PADDING+row*CELL)) > STONE_R+2) return null;
+  return {row, col};
+}
+
+async function onBoardClick(e) {
+  if (gameOver) return;
+  if (currentPlayer !== myPlayer) return;
+  if (window._status !== 'playing') return;
+  const pos = getClickPos(e); if (!pos) return;
+  if (grid[pos.row][pos.col] !== 0) return;
+  await doMove(pos.row, pos.col);
+}
+
+async function doMove(row, col) {
+  grid[row][col] = myPlayer;
+  moveCount++;
+  lastMove = {row, col};
+  const wc = checkWin(grid, row, col);
+  const draw = !wc && isBoardFull(grid);
+  const next = (wc||draw) ? myPlayer : (myPlayer===BLACK?WHITE:BLACK);
+  if (wc) { gameOver=true; winner=myPlayer; winCells=wc; }
+  else if (draw) { gameOver=true; winner=0; }
+  currentPlayer = next;
+
+  const up = { grid, currentPlayer, lastMove, moveCount };
+  if (gameOver) { up.gameOver = true; up.winner = winner; up.winCells = winCells; up.status = 'finished'; }
+  up.updateTime = Date.now();
+  try { await fetch(`${FB}/games/${roomId}.json`, {method:'PATCH', body:JSON.stringify(up)}); }
+  catch(e) { grid[row][col]=0; moveCount--; return; }
+
+  drawBoard(); updateStatusBar();
+  if (gameOver) showWin();
+}
+
+// ─── Watch (polling) ─────────
+function startWatch() { if (watchTimer) clearInterval(watchTimer);
+  watchTimer = setInterval(async () => {
+    try { const r = await fetch(`${FB}/games/${roomId}.json`); const g = await r.json();
+      if (!g) return;
+      if (g.updateTime === lastUpdateTime) return;
+      lastUpdateTime = g.updateTime;
+      const prevStatus = window._status;
+      applyState(g.grid, g.currentPlayer, g.lastMove, g.moveCount, g.gameOver, g.winner, g.winCells, g.status);
+      if (g.status !== prevStatus) { render(); return; } // re-render on status change (waiting→playing)
+      drawBoard(); updateStatusBar();
+      if (g.gameOver && g.winner !== 0) showWin();
+    } catch(e) {}
+  }, 600);
+}
+
+function showWin() {
+  const msg = winner===0?'🤝 平局！势均力敌！':`🏆 ${winner===BLACK?'黑棋':'白棋'}在第 ${moveCount} 手获胜！`;
+  const isMe = winner===myPlayer;
+  setTimeout(()=>alert((isMe?'你赢了！':'你输了')+'\n'+msg), 200);
+}
+
+// ─── Events ───────────────
+function bindGame() {
+  const c = document.getElementById('board'); if (c) {
+    c.onclick = onBoardClick;
+    c.onmousemove = e => { hoverPos = getClickPos(e); drawBoard(); };
+    c.onmouseleave = () => { hoverPos = null; drawBoard(); };
+  }
+  const bl = document.getElementById('btnLeave'); if (bl) bl.onclick = leaveRoom;
+  const br = document.getElementById('btnRestart'); if (br) br.onclick = restartGame;
+}
+
+async function leaveRoom() {
+  try { await fetch(`${FB}/games/${roomId}.json`, {method:'PATCH', body:JSON.stringify({status:'finished',gameOver:true,updateTime:Date.now()})}); } catch(e) {}
+  if (watchTimer) clearInterval(watchTimer);
+  mode = 'lobby'; render();
+}
+
+async function restartGame() {
+  const init = { grid:emptyGrid(), currentPlayer:BLACK, lastMove:null, moveCount:0, gameOver:false, winner:0, winCells:[], status:'playing', updateTime:Date.now() };
+  try { await fetch(`${FB}/games/${roomId}.json`, {method:'PATCH', body:JSON.stringify(init)}); } catch(e) {}
+}
+
+// ─── Init ──────────────────
+mode = 'lobby'; render();
+// ─── Animation loop ────────
+function animLoop() { if (mode==='game'&&!gameOver&&lastMove) drawBoard(); requestAnimationFrame(animLoop); }
+requestAnimationFrame(animLoop);
+</script>
+<style>
+  :root { --bg:#f5f0e8;--board:#dcb35c;--line:#5a3e1b;--text:#3b2f1e;--accent:#8b5e3c;--accent-light:#c4956a;--card:#fdfaf3;--shadow:0 4px 24px rgba(0,0,0,.1);--radius:16px; }
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:"Inter","PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:linear-gradient(135deg,#e8dcc8,#d5c4a1 30%,#e2cfb2 70%,#ede0ca);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;color:var(--text);user-select:none}
+  .container{display:flex;flex-direction:column;align-items:center;gap:20px;max-width:700px;width:100%}
+  .header{text-align:center}.header h1{font-size:2rem;font-weight:700;letter-spacing:.08em;color:var(--text);margin-bottom:4px}.header .subtitle{font-size:.85rem;color:var(--accent);opacity:.7}
+  .deco{display:flex;gap:80px;margin-bottom:16px}.deco-stone{width:64px;height:64px;border-radius:50%}.deco-stone.black{background:radial-gradient(circle at 35% 35%,#555,#111 60%,#000);box-shadow:0 4px 12px rgba(0,0,0,.3)}.deco-stone.white{background:radial-gradient(circle at 35% 35%,#fff,#e0dcd4 60%,#c4bfb4);box-shadow:0 4px 12px rgba(0,0,0,.1)}
+  .lobby-card{width:100%;max-width:600px;background:var(--card);border-radius:var(--radius);padding:32px 36px;box-shadow:var(--shadow);margin-bottom:20px;display:flex;flex-direction:column;align-items:center}
+  .card-title{font-size:1.2rem;font-weight:700;margin-bottom:4px}.card-desc{font-size:.85rem;color:var(--accent);opacity:.6;margin-bottom:20px}
+  .room-input{width:100%;height:52px;background:#f5f0e8;border-radius:12px;padding:0 20px;font-size:1.5rem;font-weight:700;letter-spacing:.15em;text-align:center;border:3px solid #d5c4a1;margin-bottom:16px;outline:none;font-family:inherit;color:var(--text)}
+  .room-input:focus{border-color:var(--accent)}
+  .room-result{margin-top:12px;font-size:.85rem;font-weight:600;text-align:center}
+  .tip{font-size:.8rem;color:var(--accent);opacity:.5;margin-top:4px}
+  .status-bar{display:flex;align-items:center;gap:16px;background:var(--card);padding:12px 28px;border-radius:999px;box-shadow:var(--shadow);font-size:.9rem;font-weight:600}
+  .stone-icon{display:inline-block;width:28px;height:28px;border-radius:50%;flex-shrink:0}
+  .stone-icon.black{background:radial-gradient(circle at 35% 35%,#555,#111 60%,#000);box-shadow:0 2px 6px rgba(0,0,0,.35)}
+  .stone-icon.white{background:radial-gradient(circle at 35% 35%,#fff,#e0dcd4 60%,#c4bfb4);box-shadow:0 2px 6px rgba(0,0,0,.18)}
+  .turn-text{min-width:80px;text-align:center}.captures{font-size:.75rem;opacity:.6}
+  .board-wrapper{position:relative;background:var(--card);border-radius:var(--radius);padding:28px 24px 24px;box-shadow:var(--shadow);display:flex;flex-direction:column;align-items:center}
+  .col-labels{display:flex;padding-left:22px;margin-bottom:2px}.col-labels span,.row-labels span{width:36px;text-align:center;font-size:.72rem;font-weight:600;color:var(--accent);opacity:.65}.row-labels span{height:36px;line-height:36px}
+  .board-area{display:flex}.row-labels{display:flex;flex-direction:column;padding-right:6px}
+  canvas{display:block;border-radius:6px;cursor:pointer;transition:box-shadow .2s}canvas:hover{box-shadow:0 0 0 3px var(--accent-light)}
+  .actions{display:flex;gap:12px;flex-wrap:wrap;justify-content:center}
+  .btn{padding:10px 28px;border-radius:999px;border:none;font-weight:600;font-size:.9rem;cursor:pointer;font-family:inherit;letter-spacing:.03em;transition:all .18s;box-shadow:0 2px 8px rgba(0,0,0,.08);background:var(--card);color:var(--text)}
+  .btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#7a5030;transform:translateY(-1px);box-shadow:0 4px 14px rgba(0,0,0,.16)}
+  .btn-outline{background:transparent;border:2px solid var(--accent);color:var(--accent)}.btn-outline:hover{background:var(--accent);color:#fff}
+  .btn:disabled{opacity:.35;pointer-events:none}
+  @media(max-width:580px){.board-wrapper{padding:14px 10px 12px}.col-labels span{width:28px;font-size:.65rem}.row-labels span{height:28px;line-height:28px;font-size:.65rem}canvas{width:100%;height:auto}.header h1{font-size:1.5rem}}
+</style>
+</body>
+</html>
